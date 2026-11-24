@@ -2,29 +2,28 @@
 
 ## Session overview
 
-This session explains how a data engineer can process an incoming batch containing both new and changed records without creating duplicates in the target Delta table.
+A daily incremental batch can contain a new record, a changed existing record, or an unchanged existing record. This session processes all three cases and reruns the same batch to prove that the final data remains correct.
 
 ```mermaid
 flowchart TD
-    A["Set up Fabric Trial workspace"] --> B["Create target Delta table"]
-    B --> C["Create incoming daily batch"]
-    C --> D["Observe the direct append problem"]
-    D --> E["Validate source business keys"]
-    E --> F["Run Delta MERGE"]
-    F --> G["Rerun the same batch"]
-    G --> H["Prove idempotency"]
+    A["Create starting target"] --> B["Create incoming batch"]
+    B --> C["Predict row actions"]
+    C --> D["Prove append problem"]
+    D --> E["Validate business keys"]
+    E --> F["Use MERGE for upsert"]
+    F --> G["Compare before and after"]
+    G --> H["Rerun and prove idempotency"]
 ```
 
-By the end of the session, you will be able to:
-
-| Topic | What you will understand |
+| By the end of the session | Evidence produced in the notebook |
 |---|---|
-| Incremental batch | How a batch can contain new, changed, and unchanged records |
-| Business key | How `order_id` identifies the same business record across datasets |
-| Append problem | Why directly appending an incremental batch creates duplicates |
-| Delta `MERGE` | How matched rows are updated and unmatched rows are inserted |
-| Idempotency | How rerunning the same batch produces the same target data |
-| Validation | How to check keys, row counts, duplicates, and merge metrics |
+| Distinguish append, MERGE, and upsert | Comparison and append failure demonstration |
+| Explain how MERGE chooses an action | Planned action for every incoming row |
+| Update changed rows and insert new rows | Complete before-and-after comparison |
+| Avoid rewriting unchanged matched rows | Conditional update and MERGE metrics |
+| Prove data idempotency | Identical target state before and after a rerun |
+
+Run every cell from top to bottom. Cell 02 deliberately resets the session tables so the demonstration always begins from the same state.
 
 ---
 
@@ -33,101 +32,109 @@ By the end of the session, you will be able to:
 ### 1.1 Create the workspace
 
 1. Sign in to [Microsoft Fabric](https://app.fabric.microsoft.com).
-2. Select **Workspaces**.
-3. Select **+ New workspace**.
-4. Enter the following details:
+2. Select **Workspaces** and then **+ New workspace**.
+3. Enter:
 
 | Setting | Value |
 |---|---|
-| Name | `TG117_Fabric_Session06` |
-| Description | `Delta merge and idempotent incremental loads` |
-| Workspace type | **Fabric Trial capacity** |
+| Name | <code>TG117_Fabric_Session06</code> |
+| Description | <code>Delta merge and idempotent incremental loads</code> |
+| Advanced → Workspace type | **Fabric Trial capacity** |
 
-5. Select **Apply**.
+4. Select **Apply**.
 
-### 1.2 Create the Lakehouse
+### 1.2 Confirm the Spark runtime
 
-1. Open `TG117_Fabric_Session06`.
-2. Select **+ New item**.
-3. Search for and select **Lakehouse**.
-4. Enter the name:
+New Fabric workspaces use Runtime 2.0 by default. It includes Apache Spark 4.1 and Delta Lake 4.2.
 
-```text
-LH_Delta_Merge
-```
-
-5. If the **Lakehouse schemas** option is displayed, clear it for this session.
-6. Select **Create**.
-
-### 1.3 Create the Notebook
-
-1. Open `LH_Delta_Merge`.
-2. Select **Analyze data with** from the Lakehouse ribbon.
-3. Select **Notebook** and then **New notebook**.
-4. Rename the Notebook:
+For an older workspace, verify:
 
 ```text
-NB_Delta_Merge_Idempotency
+Workspace → Workspace settings
+→ Data Engineering/Science
+→ Spark settings
+→ Environment
+→ Runtime version 2.0
 ```
 
-5. Confirm that `LH_Delta_Merge` appears in the Notebook's Lakehouse explorer and is marked as the default Lakehouse.
+### 1.3 Create the Lakehouse and Notebook
 
-If the Notebook option is not shown on the Lakehouse ribbon, use:
+1. Open <code>TG117_Fabric_Session06</code>.
+2. Select **+ New item → Lakehouse**.
+3. Name it <code>LH_Delta_Merge</code>.
+4. If **Lakehouse schemas** is displayed, leave it turned off for this session.
+5. Select **Create**.
+6. Open the Lakehouse and select **Analyze data with → Notebook → New notebook**.
+7. Rename it <code>NB_Delta_Merge_Idempotency</code>.
+8. Confirm that <code>LH_Delta_Merge</code> has the pin icon marking it as the default Lakehouse.
+
+If the Notebook option is not visible:
 
 ```text
 Workspace → + New item → Notebook
 Notebook → Add lakehouse → Existing lakehouse → LH_Delta_Merge
 ```
 
-```mermaid
-flowchart LR
-    A["Fabric Trial capacity"] --> B["Session 06 workspace"]
-    B --> C["LH Delta Merge"]
-    B --> D["Merge Notebook"]
-    D --> C
-```
+### Cell 01 Verify the notebook connection
 
-### Cell 01 Verify the connection
+**Purpose:** Confirm that Spark has started and that relative paths can reach the default Lakehouse.
 
 ```python
-print("Spark application:", spark.sparkContext.applicationId)
+print("Spark version:", spark.version)
+print("Current Spark database:", spark.catalog.currentDatabase())
 
-assert notebookutils.fs.exists("Files")
-assert notebookutils.fs.exists("Tables")
+files_root_exists = notebookutils.fs.exists("Files")
 
-print("The default Lakehouse is accessible.")
+assert files_root_exists, (
+    "The Files area is not accessible. "
+    "Confirm that LH_Delta_Merge is attached and set as default."
+)
+
+print("Default Lakehouse connection verified.")
 ```
 
 The first Spark cell can take additional time while Fabric starts the Spark session.
 
 ---
 
-## 2 Production requirement
+## 2 Business requirement
 
-ShopKart already has an order table. At the end of the day, the data engineer receives a new batch containing:
+The data engineer maintains <code>shopkart_orders</code>. A daily batch contains new and existing orders. The same batch might be submitted again after a timeout or an uncertain pipeline result.
 
-- An existing order whose values have changed
-- An existing order whose values have not changed
-- New orders that do not yet exist in the target table
-
-The batch may be rerun if a pipeline times out or its completion status is uncertain. Rerunning it must not create duplicate orders.
+| Incoming situation | Required target action |
+|---|---|
+| Order ID does not exist | Insert the order |
+| Order ID exists and values changed | Update the existing order |
+| Order ID exists and values are identical | Make no data change |
+| The same batch is submitted again | Keep the same final target data |
 
 ```mermaid
 flowchart TD
-    A["Existing target table"] --> C["Daily incremental processing"]
-    B["Incoming batch"] --> C
-    C --> D["Update changed orders"]
-    C --> E["Insert new orders"]
-    C --> F["Keep unchanged orders unchanged"]
+    A["Incoming order"] --> B{"Order ID exists?"}
+    B -->|"No"| C["INSERT"]
+    B -->|"Yes"| D{"Values changed?"}
+    D -->|"Yes"| E["UPDATE"]
+    D -->|"No"| F["NO CHANGE"]
 ```
+
+The <code>order_id</code> column is the business key. It identifies the same business order in the source and target.
 
 ---
 
-## 3 Create the target Delta table
+## 3 Task 1 Create the known starting target
 
-### Cell 02 Create the baseline DataFrame
+### Purpose and state change
+
+Create four existing orders as the controlled starting state.
+
+| Before | Action | After |
+|---|---|---|
+| No session table is required | Reset and create <code>shopkart_orders</code> | 4 rows and 4 distinct order IDs |
+
+### Cell 02 Reset and create the target Delta table
 
 ```python
+from pyspark.sql import functions as F
 from pyspark.sql.types import (
     StructType,
     StructField,
@@ -149,17 +156,8 @@ target_data = [
     ("O1004", "C004", 2500, "Completed")
 ]
 
-target_df = spark.createDataFrame(
-    target_data,
-    order_schema
-)
+target_df = spark.createDataFrame(target_data, order_schema)
 
-display(target_df.orderBy("order_id"))
-```
-
-### Cell 03 Create a clean target table
-
-```python
 spark.sql("DROP TABLE IF EXISTS shopkart_orders")
 spark.sql("DROP TABLE IF EXISTS append_problem_orders")
 
@@ -168,25 +166,16 @@ target_df.write \
     .mode("overwrite") \
     .saveAsTable("shopkart_orders")
 
-print("Target Delta table created.")
+starting_target_df = spark.table("shopkart_orders")
+
+assert starting_target_df.count() == 4
+assert starting_target_df.select("order_id").distinct().count() == 4
+
+display(starting_target_df.orderBy("order_id"))
+print("Starting target created and validated.")
 ```
 
-### Cell 04 Validate the target table
-
-```python
-current_target_df = spark.table("shopkart_orders")
-
-assert current_target_df.count() == 4
-assert current_target_df.select(
-    "order_id"
-).distinct().count() == 4
-
-display(current_target_df.orderBy("order_id"))
-
-print("Target validation completed.")
-```
-
-Expected target state:
+### Expected result
 
 | order_id | customer_id | order_amount | order_status |
 |---|---|---:|---|
@@ -195,11 +184,24 @@ Expected target state:
 | O1003 | C003 | 600 | Pending |
 | O1004 | C004 | 2500 | Completed |
 
+**What this proves:** Every later change can be measured against a known four-row target.
+
 ---
 
-## 4 Create the incoming daily batch
+## 4 Task 2 Create the batch and predict every action
 
-### Cell 05 Create the source DataFrame
+### Purpose and expected decisions
+
+Inspect the incoming rows before changing the target.
+
+| Source order | Present in target | Values changed | Expected action |
+|---|---:|---:|---|
+| O1002 | Yes | Yes | UPDATE |
+| O1004 | Yes | No | NO CHANGE |
+| O1005 | No | Not applicable | INSERT |
+| O1006 | No | Not applicable | INSERT |
+
+### Cell 03 Create the incoming batch
 
 ```python
 incoming_data = [
@@ -214,67 +216,88 @@ incoming_orders_df = spark.createDataFrame(
     order_schema
 )
 
-incoming_orders_df.createOrReplaceTempView(
-    "incoming_orders"
-)
+incoming_orders_df.createOrReplaceTempView("incoming_orders")
+
+assert incoming_orders_df.count() == 4
 
 display(incoming_orders_df.orderBy("order_id"))
+print("Incoming batch created.")
 ```
 
-### Decide what should happen to every source row
+### Cell 04 Preview what MERGE should do
 
-| Source order | Present in target | Values changed | Required action |
-|---|---|---|---|
-| O1002 | Yes | Yes | Update |
-| O1004 | Yes | No | Keep unchanged |
-| O1005 | No | Not applicable | Insert |
-| O1006 | No | Not applicable | Insert |
-
-```mermaid
-flowchart TD
-    A["Incoming source row"] --> B{"order ID exists?"}
-    B -->|"No"| C["Insert new row"]
-    B -->|"Yes"| D{"Values changed?"}
-    D -->|"Yes"| E["Update existing row"]
-    D -->|"No"| F["Make no data change"]
-```
-
----
-
-## 5 Understand the business key
-
-A **business key** is a column or combination of columns that identifies one business record.
-
-For the ShopKart order table:
-
-```text
-Business key = order_id
-```
-
-The merge condition will use `order_id` to decide whether a source record already exists in the target.
-
-```mermaid
-flowchart LR
-    A["Source order ID"] --> C{"Match?"}
-    B["Target order ID"] --> C
-    C -->|"Yes"| D["Matched action"]
-    C -->|"No"| E["Not-matched action"]
-```
-
-The matching key should represent the identity of the record. Using a mutable value such as `order_status` as the key would create incorrect matches.
-
----
-
-## 6 Why direct append is incorrect
-
-Appending the complete incoming batch does not check whether an `order_id` already exists.
-
-To demonstrate the problem safely, create a separate table. The correct target table will remain unchanged.
-
-### Cell 06 Create the append demonstration table
+The <code>&lt;=&gt;</code> operator is null-safe equality. It treats two nulls as equal and one null versus one non-null value as different.
 
 ```python
-spark.table("shopkart_orders").write \
+planned_actions_df = spark.sql("""
+    SELECT
+        source.order_id,
+        target.order_amount AS target_amount,
+        source.order_amount AS incoming_amount,
+        target.order_status AS target_status,
+        source.order_status AS incoming_status,
+        CASE
+            WHEN target.order_id IS NULL
+                THEN 'INSERT'
+            WHEN NOT (
+                target.customer_id <=> source.customer_id
+                AND target.order_amount <=> source.order_amount
+                AND target.order_status <=> source.order_status
+            )
+                THEN 'UPDATE'
+            ELSE 'NO CHANGE'
+        END AS planned_action
+    FROM incoming_orders AS source
+    LEFT JOIN shopkart_orders AS target
+        ON target.order_id = source.order_id
+    ORDER BY source.order_id
+""")
+
+expected_actions = {
+    "O1002": "UPDATE",
+    "O1004": "NO CHANGE",
+    "O1005": "INSERT",
+    "O1006": "INSERT"
+}
+
+actual_actions = {
+    row["order_id"]: row["planned_action"]
+    for row in planned_actions_df.collect()
+}
+
+assert actual_actions == expected_actions
+
+display(planned_actions_df)
+print("Every incoming row has an expected action.")
+```
+
+### Expected result
+
+| order_id | target_amount | incoming_amount | target_status | incoming_status | planned_action |
+|---|---:|---:|---|---|---|
+| O1002 | 850 | 900 | Pending | Completed | UPDATE |
+| O1004 | 2500 | 2500 | Completed | Completed | NO CHANGE |
+| O1005 | null | 1500 | null | Pending | INSERT |
+| O1006 | null | 700 | null | Completed | INSERT |
+
+**What this proves:** The requirement has been translated into a row-by-row decision before any write occurs.
+
+---
+
+## 5 Task 3 Prove why direct append is unsafe
+
+### Purpose and state change
+
+Append adds every source row without checking whether its business key already exists. A separate table keeps this failure demonstration away from the correct target.
+
+| Before | Action | After |
+|---|---|---|
+| 4 baseline rows | Append all 4 incoming rows | 8 physical rows but only 6 distinct order IDs |
+
+### Cell 05 Append to the demonstration table
+
+```python
+target_df.write \
     .format("delta") \
     .mode("overwrite") \
     .saveAsTable("append_problem_orders")
@@ -284,17 +307,7 @@ incoming_orders_df.write \
     .mode("append") \
     .saveAsTable("append_problem_orders")
 
-print("Incoming batch appended to the demonstration table.")
-```
-
-### Cell 07 Find duplicate business keys
-
-```python
-from pyspark.sql import functions as F
-
-append_problem_df = spark.table(
-    "append_problem_orders"
-)
+append_problem_df = spark.table("append_problem_orders")
 
 append_duplicates_df = (
     append_problem_df
@@ -304,19 +317,17 @@ append_duplicates_df = (
     .orderBy("order_id")
 )
 
+assert append_problem_df.count() == 8
+assert append_problem_df.select("order_id").distinct().count() == 6
+assert append_duplicates_df.count() == 2
+
 display(append_problem_df.orderBy("order_id"))
 display(append_duplicates_df)
 
-assert append_problem_df.count() == 8
-assert append_problem_df.select(
-    "order_id"
-).distinct().count() == 6
-assert append_duplicates_df.count() == 2
-
-print("Direct append created duplicate business keys.")
+print("Append created duplicate business keys.")
 ```
 
-Expected duplicate result:
+### Expected duplicate result
 
 | order_id | count |
 |---|---:|
@@ -325,134 +336,163 @@ Expected duplicate result:
 
 ```mermaid
 flowchart LR
-    A["Four target rows"] --> C["Direct append"]
-    B["Four source rows"] --> C
-    C --> D["Eight physical rows"]
-    D --> E["Duplicate O1002 and O1004"]
+    A["4 baseline rows"] --> C["APPEND"]
+    B["4 incoming rows"] --> C
+    C --> D["8 physical rows"]
+    D --> E["Only 6 distinct IDs"]
 ```
 
-### Cell 08 Remove the demonstration table
+**What this proves:** Append is suitable for purely new rows, not a mixed incremental batch containing existing keys.
+
+### Cell 06 Remove only the demonstration table
 
 ```python
 spark.sql("DROP TABLE IF EXISTS append_problem_orders")
 
-assert spark.table("shopkart_orders").count() == 4
+correct_target_df = spark.table("shopkart_orders")
 
-print("The correct target table remains unchanged.")
+assert correct_target_df.count() == 4
+assert correct_target_df.select("order_id").distinct().count() == 4
+
+print("Demonstration table removed.")
+print("The correct target still contains four rows.")
 ```
 
 ---
 
-## 7 Understand MERGE and upsert
+## 6 Upsert is the goal and MERGE is the command
 
-`MERGE` compares a source dataset with a target Delta table using a matching condition.
+| Term | Meaning | Role in this session |
+|---|---|---|
+| Upsert | Update an existing key or insert a new key | Required business behavior |
+| MERGE | Delta command that compares source and target and executes configured clauses | Command used to implement the upsert |
 
-An **upsert** combines two actions:
+A <code>MERGE</code> implements an upsert when it has both:
 
-- Update a target record when the key matches
-- Insert a source record when the key does not match
+- <code>WHEN MATCHED ... UPDATE</code>
+- <code>WHEN NOT MATCHED ... INSERT</code>
 
-```mermaid
-flowchart TD
-    A["MERGE source into target"] --> B{"Business key match"}
-    B -->|"Matched and changed"| C["UPDATE"]
-    B -->|"Matched and unchanged"| D["No data change"]
-    B -->|"Not matched"| E["INSERT"]
-```
+Not every <code>MERGE</code> is an upsert. MERGE can also implement update-only, insert-only, delete, or full synchronization logic.
 
-The target is the table being changed. The source provides the incoming records.
-
-| MERGE part | Purpose in this exercise |
-|---|---|
-| `MERGE INTO shopkart_orders` | Selects the target Delta table |
-| `USING incoming_orders` | Selects the incoming source view |
-| `ON target.order_id = source.order_id` | Matches the same business order |
-| `WHEN MATCHED AND ...` | Updates only when values changed |
-| `WHEN NOT MATCHED` | Inserts new orders |
+| Operation | Checks the key | Updates existing rows | Inserts new rows | Suitable here |
+|---|---:|---:|---:|---:|
+| Append | No | No | Yes | No |
+| MERGE with matched update only | Yes | Yes | No | Incomplete |
+| MERGE with not-matched insert only | Yes | No | Yes | Incomplete |
+| MERGE configured as an upsert | Yes | Yes | Yes | Yes |
 
 ---
 
-## 8 Validate the source before MERGE
+## 7 Task 4 Validate both sides before MERGE
 
-The source must contain a valid and unique business key. If two source rows have the same key, both can attempt to modify the same target row.
+### Purpose
 
-### Cell 09 Check null and duplicate keys
+Delta does not automatically enforce business-key uniqueness. Validate both source and target before writing.
+
+### Cell 07 Run key safety checks
 
 ```python
-null_key_count = incoming_orders_df.filter(
-    F.col("order_id").isNull()
-).count()
+def key_profile(dataframe, key_column):
+    null_key_count = dataframe.filter(
+        F.col(key_column).isNull()
+    ).count()
 
-duplicate_source_keys_df = (
-    incoming_orders_df
-    .groupBy("order_id")
-    .count()
-    .filter(F.col("count") > 1)
+    duplicate_key_count = (
+        dataframe
+        .groupBy(key_column)
+        .count()
+        .filter(F.col("count") > 1)
+        .count()
+    )
+
+    return null_key_count, duplicate_key_count
+
+
+source_nulls, source_duplicates = key_profile(
+    incoming_orders_df,
+    "order_id"
 )
 
-assert null_key_count == 0
-assert duplicate_source_keys_df.count() == 0
-assert incoming_orders_df.count() == 4
+target_before_merge_df = spark.table("shopkart_orders")
 
-print("Source key validation passed.")
+target_nulls, target_duplicates = key_profile(
+    target_before_merge_df,
+    "order_id"
+)
+
+key_checks_df = spark.createDataFrame(
+    [
+        ("incoming source", source_nulls, source_duplicates),
+        ("target table", target_nulls, target_duplicates)
+    ],
+    ["dataset", "null_order_ids", "duplicate_order_ids"]
+)
+
+display(key_checks_df)
+
+if source_nulls > 0 or source_duplicates > 0:
+    raise ValueError(
+        "MERGE stopped: source keys are not valid and unique."
+    )
+
+if target_nulls > 0 or target_duplicates > 0:
+    raise ValueError(
+        "MERGE stopped: target keys are not valid and unique."
+    )
+
+print("Source and target key checks passed.")
 ```
 
-```mermaid
-flowchart LR
-    A["Incoming batch"] --> B["Check null keys"]
-    B --> C["Check duplicate keys"]
-    C --> D["Run MERGE"]
-```
+### Expected result
+
+| dataset | null_order_ids | duplicate_order_ids |
+|---|---:|---:|
+| incoming source | 0 | 0 |
+| target table | 0 | 0 |
+
+**What this proves:** Each business key has one reliable source row and at most one reliable target row.
 
 ---
 
-## 9 Capture the target state before MERGE
+## 8 Task 5 Execute a conditional upsert with MERGE
 
-### Cell 10 Record the before state
+### Purpose and expected state change
+
+Update O1002, insert O1005 and O1006, and avoid rewriting identical O1004.
+
+| Measurement | Before MERGE | Expected after MERGE |
+|---|---:|---:|
+| Total target rows | 4 | 6 |
+| Distinct order IDs | 4 | 6 |
+| Updated rows | 0 | 1 |
+| Inserted rows | 0 | 2 |
+| Unchanged source match | 0 | 1 |
+
+### Cell 08 Capture the before-state and run MERGE
 
 ```python
-target_before_merge_df = spark.table(
-    "shopkart_orders"
-)
-
-display(target_before_merge_df.orderBy("order_id"))
-
 before_merge_rows = sorted(
-    [tuple(row) for row in target_before_merge_df.collect()]
+    tuple(row)
+    for row in spark.table("shopkart_orders").collect()
+)
+
+version_before_merge = int(
+    spark.sql("DESCRIBE HISTORY shopkart_orders")
+    .agg(F.max("version").alias("latest_version"))
+    .first()["latest_version"]
 )
 
 assert len(before_merge_rows) == 4
 
-print("Target state captured before MERGE.")
-```
-
-Expected changes after the first merge:
-
-| Measurement | Before MERGE | After MERGE |
-|---|---:|---:|
-| Total rows | 4 | 6 |
-| Distinct order IDs | 4 | 6 |
-| Updated rows | 0 | 1 |
-| Newly inserted rows | 0 | 2 |
-
----
-
-## 10 Run the first MERGE
-
-The matched condition checks whether any non-key value changed. This prevents an unchanged order such as `O1004` from being updated unnecessarily.
-
-### Cell 11 Execute MERGE
-
-```python
 merge_sql = """
     MERGE INTO shopkart_orders AS target
     USING incoming_orders AS source
     ON target.order_id = source.order_id
 
-    WHEN MATCHED AND (
-        target.customer_id <> source.customer_id
-        OR target.order_amount <> source.order_amount
-        OR target.order_status <> source.order_status
+    WHEN MATCHED AND NOT (
+        target.customer_id <=> source.customer_id
+        AND target.order_amount <=> source.order_amount
+        AND target.order_status <=> source.order_status
     ) THEN UPDATE SET
         target.customer_id = source.customer_id,
         target.order_amount = source.order_amount,
@@ -473,33 +513,26 @@ merge_sql = """
 
 spark.sql(merge_sql)
 
-print("First MERGE completed.")
+print("MERGE completed.")
+print("Target version before MERGE:", version_before_merge)
 ```
 
-### Internal decision flow
+| MERGE section | Decision |
+|---|---|
+| <code>ON target.order_id = source.order_id</code> | Does the same order exist? |
+| <code>WHEN MATCHED AND NOT (...)</code> | Did one or more compared values change? |
+| <code>WHEN NOT MATCHED</code> | Is this a new order ID? |
 
-```mermaid
-flowchart TD
-    A["Read source row"] --> B{"Matching order ID?"}
-    B -->|"No"| C["Write inserted row"]
-    B -->|"Yes"| D{"Values different?"}
-    D -->|"Yes"| E["Write updated row"]
-    D -->|"No"| F["Skip data update"]
-    C --> G["Commit MERGE"]
-    E --> G
-    F --> G
-```
+Null-safe comparisons prevent a future issue: normal inequality can return an unknown result when one side is null.
 
 ---
 
-## 11 Validate the first MERGE
+## 9 Task 6 Prove the first MERGE result
 
-### Cell 12 Validate counts and business keys
+### Cell 09 Validate counts, keys, and complete row values
 
 ```python
-target_after_merge_df = spark.table(
-    "shopkart_orders"
-)
+target_after_merge_df = spark.table("shopkart_orders")
 
 duplicate_target_keys_df = (
     target_after_merge_df
@@ -508,63 +541,104 @@ duplicate_target_keys_df = (
     .filter(F.col("count") > 1)
 )
 
+expected_after_first_merge = sorted([
+    ("O1001", "C001", 1200, "Completed"),
+    ("O1002", "C002", 900, "Completed"),
+    ("O1003", "C003", 600, "Pending"),
+    ("O1004", "C004", 2500, "Completed"),
+    ("O1005", "C005", 1500, "Pending"),
+    ("O1006", "C006", 700, "Completed")
+])
+
+actual_after_first_merge = sorted(
+    tuple(row)
+    for row in target_after_merge_df.collect()
+)
+
 assert target_after_merge_df.count() == 6
-assert target_after_merge_df.select(
-    "order_id"
-).distinct().count() == 6
+assert target_after_merge_df.select("order_id").distinct().count() == 6
 assert duplicate_target_keys_df.count() == 0
+assert actual_after_first_merge == expected_after_first_merge
 
 display(target_after_merge_df.orderBy("order_id"))
-
-print("Target keys and row counts are valid.")
+print("Counts, keys, and complete row values are correct.")
 ```
 
-### Cell 13 Validate updated and inserted orders
+### Cell 10 Display before-and-after evidence
 
 ```python
-o1002 = target_after_merge_df.filter(
-    "order_id = 'O1002'"
-).first()
+before_df = target_df.alias("before")
+after_df = target_after_merge_df.alias("after")
 
-o1004 = target_after_merge_df.filter(
-    "order_id = 'O1004'"
-).first()
+same_non_key_values = (
+    F.col("before.customer_id").eqNullSafe(
+        F.col("after.customer_id")
+    )
+    & F.col("before.order_amount").eqNullSafe(
+        F.col("after.order_amount")
+    )
+    & F.col("before.order_status").eqNullSafe(
+        F.col("after.order_status")
+    )
+)
 
-assert o1002["order_amount"] == 900
-assert o1002["order_status"] == "Completed"
+before_after_df = (
+    before_df
+    .join(
+        after_df,
+        F.col("before.order_id") == F.col("after.order_id"),
+        "full"
+    )
+    .select(
+        F.coalesce(
+            F.col("before.order_id"),
+            F.col("after.order_id")
+        ).alias("order_id"),
+        F.col("before.order_amount").alias("before_amount"),
+        F.col("after.order_amount").alias("after_amount"),
+        F.col("before.order_status").alias("before_status"),
+        F.col("after.order_status").alias("after_status"),
+        F.when(
+            F.col("before.order_id").isNull(),
+            F.lit("INSERTED")
+        )
+        .when(
+            F.col("after.order_id").isNull(),
+            F.lit("DELETED")
+        )
+        .when(
+            ~same_non_key_values,
+            F.lit("UPDATED")
+        )
+        .otherwise(
+            F.lit("UNCHANGED")
+        )
+        .alias("result")
+    )
+    .orderBy("order_id")
+)
 
-assert o1004["order_amount"] == 2500
-assert o1004["order_status"] == "Completed"
-
-assert target_after_merge_df.filter(
-    "order_id = 'O1005'"
-).count() == 1
-
-assert target_after_merge_df.filter(
-    "order_id = 'O1006'"
-).count() == 1
-
-print("Update, unchanged, and insert validations passed.")
+display(before_after_df)
 ```
 
-Expected target state:
+### Expected comparison
 
-| order_id | customer_id | order_amount | order_status | Result |
-|---|---|---:|---|---|
-| O1001 | C001 | 1200 | Completed | Existing row retained |
-| O1002 | C002 | 900 | Completed | Updated |
-| O1003 | C003 | 600 | Pending | Existing row retained |
-| O1004 | C004 | 2500 | Completed | Matched but unchanged |
-| O1005 | C005 | 1500 | Pending | Inserted |
-| O1006 | C006 | 700 | Completed | Inserted |
+| order_id | before_amount | after_amount | before_status | after_status | result |
+|---|---:|---:|---|---|---|
+| O1001 | 1200 | 1200 | Completed | Completed | UNCHANGED |
+| O1002 | 850 | 900 | Pending | Completed | UPDATED |
+| O1003 | 600 | 600 | Pending | Pending | UNCHANGED |
+| O1004 | 2500 | 2500 | Completed | Completed | UNCHANGED |
+| O1005 | null | 1500 | null | Pending | INSERTED |
+| O1006 | null | 700 | null | Completed | INSERTED |
+
+**What this proves:** The actual result matches the prediction made before MERGE.
 
 ---
 
-## 12 Inspect the first MERGE history
+## 10 Task 7 Inspect the Delta transaction evidence
 
-`DESCRIBE HISTORY` can show the `MERGE` operation and its available operation metrics.
-
-### Cell 14 Read the latest MERGE entry
+### Cell 11 Read the latest MERGE entry
 
 ```python
 first_merge_history = (
@@ -582,246 +656,176 @@ first_merge_history = (
 )
 
 assert first_merge_history is not None
+assert int(first_merge_history["version"]) > version_before_merge
 
-first_merge_metrics = (
+first_merge_metrics = dict(
     first_merge_history["operationMetrics"] or {}
 )
 
 print("MERGE version:", first_merge_history["version"])
 print("Source rows:", first_merge_metrics.get("numSourceRows"))
-print("Inserted rows:", first_merge_metrics.get("numTargetRowsInserted"))
-print("Updated rows:", first_merge_metrics.get("numTargetRowsUpdated"))
+print(
+    "Inserted rows:",
+    first_merge_metrics.get("numTargetRowsInserted")
+)
+print(
+    "Updated rows:",
+    first_merge_metrics.get("numTargetRowsUpdated")
+)
+
+expected_metrics = {
+    "numSourceRows": 4,
+    "numTargetRowsInserted": 2,
+    "numTargetRowsUpdated": 1
+}
+
+for metric_name, expected_value in expected_metrics.items():
+    if metric_name in first_merge_metrics:
+        assert int(first_merge_metrics[metric_name]) == expected_value
+
+print("Available row metrics match the expected result.")
 ```
 
-For this data, the expected logical result is:
-
-| Metric | Expected value |
+| Logical metric | Expected value |
 |---|---:|
-| Source rows | 4 |
+| Source rows examined | 4 |
 | Target rows inserted | 2 |
 | Target rows updated | 1 |
 
-Metric names and additional file-level measurements can vary by Fabric runtime and enabled Delta features.
-
-### Cell 15 Validate available row metrics
-
-```python
-if "numSourceRows" in first_merge_metrics:
-    assert int(first_merge_metrics["numSourceRows"]) == 4
-
-if "numTargetRowsInserted" in first_merge_metrics:
-    assert int(
-        first_merge_metrics["numTargetRowsInserted"]
-    ) == 2
-
-if "numTargetRowsUpdated" in first_merge_metrics:
-    assert int(
-        first_merge_metrics["numTargetRowsUpdated"]
-    ) == 1
-
-print("Available MERGE metrics are valid.")
-```
+Fabric can return extra file-level metrics. The exact set can vary by runtime and enabled Delta features, so a metric is asserted only when present.
 
 ---
 
-## 13 Understand idempotency
+## 11 Conditional update versus unconditional update
 
-An operation is **idempotent** when applying the same input multiple times produces the same final data state.
+The displayed values can look correct in both cases, but rerun behavior differs.
 
-```mermaid
-flowchart LR
-    A["Target plus batch"] --> B["First MERGE"]
-    B --> C["Correct target state"]
-    C --> D["Same batch again"]
-    D --> E["Same target data"]
-```
+| Matched clause | First run | Identical rerun |
+|---|---|---|
+| <code>WHEN MATCHED THEN UPDATE</code> | Updates changed O1002 and also processes identical O1004 | Matched rows can be updated again |
+| <code>WHEN MATCHED AND values changed THEN UPDATE</code> | Updates only O1002 | Zero logical updates |
 
-Idempotency does not necessarily mean that Fabric records no new operation. Fabric can record another `MERGE` commit while the target rows remain unchanged.
-
-The conditional `WHEN MATCHED` clause improves the rerun because identical matched rows do not need a logical update.
+The conditional clause avoids unnecessary logical updates and produces clearer rerun metrics.
 
 ---
 
-## 14 Rerun the same batch
+## 12 Task 8 Rerun and prove idempotency
 
-### Cell 16 Capture the state before the rerun
+An operation is data-idempotent when repeating the same input produces the same final data state.
+
+Data idempotency does not necessarily mean that no command is recorded. Fabric may record another MERGE transaction with zero inserted and zero updated rows.
+
+### Cell 12 Capture the stable state and rerun the same MERGE
 
 ```python
-before_rerun_df = spark.table("shopkart_orders")
-
 before_rerun_rows = sorted(
-    [tuple(row) for row in before_rerun_df.collect()]
+    tuple(row)
+    for row in spark.table("shopkart_orders").collect()
 )
 
-before_rerun_count = before_rerun_df.count()
-before_rerun_distinct_count = before_rerun_df.select(
-    "order_id"
-).distinct().count()
-
-history_version_before_rerun = (
+version_before_rerun = int(
     spark.sql("DESCRIBE HISTORY shopkart_orders")
     .agg(F.max("version").alias("latest_version"))
     .first()["latest_version"]
 )
 
-assert before_rerun_count == 6
-assert before_rerun_distinct_count == 6
+assert len(before_rerun_rows) == 6
 
-print("State captured before rerun.")
-```
-
-### Cell 17 Execute the identical MERGE again
-
-```python
 spark.sql(merge_sql)
 
-print("Identical batch rerun completed.")
+print("The identical incoming batch was submitted again.")
 ```
 
-### Cell 18 Prove that the data is unchanged
+### Cell 13 Compare the target and inspect the rerun
 
 ```python
 after_rerun_df = spark.table("shopkart_orders")
 
 after_rerun_rows = sorted(
-    [tuple(row) for row in after_rerun_df.collect()]
+    tuple(row)
+    for row in after_rerun_df.collect()
 )
 
-duplicate_keys_after_rerun_df = (
+duplicate_keys_after_rerun = (
     after_rerun_df
     .groupBy("order_id")
     .count()
     .filter(F.col("count") > 1)
+    .count()
 )
 
+assert after_rerun_rows == before_rerun_rows
 assert after_rerun_df.count() == 6
-assert after_rerun_df.select(
-    "order_id"
-).distinct().count() == 6
-assert duplicate_keys_after_rerun_df.count() == 0
-assert before_rerun_rows == after_rerun_rows
+assert after_rerun_df.select("order_id").distinct().count() == 6
+assert duplicate_keys_after_rerun == 0
 
-display(after_rerun_df.orderBy("order_id"))
-
-print("Idempotency proved: the target data is unchanged.")
-```
-
----
-
-## 15 Inspect the rerun metrics
-
-### Cell 19 Check whether the rerun created a new history entry
-
-```python
-history_after_rerun_df = spark.sql(
-    "DESCRIBE HISTORY shopkart_orders"
-)
-
-latest_history_after_rerun = (
-    history_after_rerun_df
+latest_history = (
+    spark.sql("DESCRIBE HISTORY shopkart_orders")
     .orderBy(F.desc("version"))
-    .select(
-        "version",
-        "timestamp",
-        "operation",
-        "operationMetrics"
-    )
+    .select("version", "operation", "operationMetrics")
     .first()
 )
 
-assert latest_history_after_rerun is not None
-
-history_version_after_rerun = int(
-    latest_history_after_rerun["version"]
-)
-
-rerun_created_new_version = (
-    history_version_after_rerun
-    > history_version_before_rerun
-)
+latest_version = int(latest_history["version"])
+rerun_created_new_version = latest_version > version_before_rerun
 
 if rerun_created_new_version:
-    assert latest_history_after_rerun["operation"] == "MERGE"
+    assert latest_history["operation"] == "MERGE"
 
-    rerun_metrics = (
-        latest_history_after_rerun["operationMetrics"]
-        or {}
+    rerun_metrics = dict(
+        latest_history["operationMetrics"] or {}
     )
 
+    if "numTargetRowsInserted" in rerun_metrics:
+        assert int(rerun_metrics["numTargetRowsInserted"]) == 0
+
+    if "numTargetRowsUpdated" in rerun_metrics:
+        assert int(rerun_metrics["numTargetRowsUpdated"]) == 0
+
+    print("Rerun created MERGE version:", latest_version)
     print(
-        "Rerun MERGE version:",
-        history_version_after_rerun
-    )
-    print(
-        "Source rows:",
-        rerun_metrics.get("numSourceRows")
-    )
-    print(
-        "Inserted rows:",
+        "Rerun inserted rows:",
         rerun_metrics.get("numTargetRowsInserted")
     )
     print(
-        "Updated rows:",
+        "Rerun updated rows:",
         rerun_metrics.get("numTargetRowsUpdated")
     )
 else:
-    rerun_metrics = {}
-    print("No new Delta version was required by the rerun.")
+    print("The rerun did not require a new Delta version.")
+
+display(after_rerun_df.orderBy("order_id"))
+print("Idempotency proved: the target data is unchanged.")
 ```
 
-Expected logical rerun result:
+### Expected rerun result
 
 | Measurement | Expected result |
 |---|---:|
-| Source rows checked | 4 |
+| Source rows examined | 4 |
 | New target rows | 0 |
-| Changed target rows | 0 |
-| Duplicate business keys | 0 |
+| Updated target rows | 0 |
+| Duplicate order IDs | 0 |
 | Final target rows | 6 |
-
-### Cell 20 Validate available rerun metrics
-
-```python
-if rerun_created_new_version:
-    if "numTargetRowsInserted" in rerun_metrics:
-        assert int(
-            rerun_metrics["numTargetRowsInserted"]
-        ) == 0
-
-    if "numTargetRowsUpdated" in rerun_metrics:
-        assert int(
-            rerun_metrics["numTargetRowsUpdated"]
-        ) == 0
-
-    print("Available rerun metrics confirm no row changes.")
-else:
-    print("The rerun required no new table version.")
-```
+| Data compared with the pre-rerun state | Identical |
 
 ```mermaid
 flowchart TD
-    A["Same four source rows"] --> B["Second MERGE"]
-    B --> C["All four keys match"]
-    C --> D["All compared values match"]
-    D --> E["Zero inserts"]
-    D --> F["Zero updates"]
-    E --> G["Target remains unchanged"]
-    F --> G
+    A["Same 4 source rows"] --> B["Run same MERGE"]
+    B --> C["All keys now exist"]
+    C --> D["All values match"]
+    D --> E["0 inserts and 0 updates"]
+    E --> F["Same 6 target rows"]
 ```
 
 ---
 
-## 16 Final validation
+## 13 Final notebook validation
 
-### Cell 21 Run complete validation
+### Cell 14 Run the complete final assertion
 
 ```python
 final_orders_df = spark.table("shopkart_orders")
-
-assert final_orders_df.count() == 6
-assert final_orders_df.select(
-    "order_id"
-).distinct().count() == 6
 
 expected_final_rows = sorted([
     ("O1001", "C001", 1200, "Completed"),
@@ -833,73 +837,82 @@ expected_final_rows = sorted([
 ])
 
 actual_final_rows = sorted(
-    [tuple(row) for row in final_orders_df.collect()]
+    tuple(row)
+    for row in final_orders_df.collect()
 )
 
 assert actual_final_rows == expected_final_rows
+assert final_orders_df.count() == 6
+assert final_orders_df.select("order_id").distinct().count() == 6
 
 display(final_orders_df.orderBy("order_id"))
-
 print("All Session 6 validations passed.")
 ```
 
 ---
 
-## 17 Common MERGE mistakes
+## 14 Important differences
 
-| Mistake | Result |
+| Concepts that look similar | Clear difference |
 |---|---|
-| Directly appending an incremental batch | Existing business keys are duplicated |
-| Using the wrong matching key | Unrelated rows can be updated or new duplicates inserted |
-| Allowing duplicate keys in the source | Multiple source rows can try to change one target row |
-| Allowing null business keys | Records cannot be matched reliably |
-| Unconditionally updating every match | Unchanged rows can be processed again unnecessarily |
-| Using different source and target data types | The merge can fail with a schema or casting error |
-| Using `WHEN NOT MATCHED BY SOURCE DELETE` without careful scope | Valid target rows absent from one batch can be deleted |
-
-The source-based delete clause is intentionally not used in this session.
+| Append and insert | Both add rows, but append does not check existing business keys |
+| MERGE and upsert | MERGE is a command; upsert is update-or-insert behavior configured with MERGE clauses |
+| MERGE and update | MERGE can choose update, insert, delete, or no action; update changes only existing rows |
+| Deduplication and idempotency | Deduplication prevents repeated keys; idempotency means a rerun reaches the same final state |
+| Same visible values and zero updates | Unconditional update may write identical values again; conditional update avoids the logical rewrite |
+| No row changes and no transaction | Data can remain unchanged even if another MERGE transaction is recorded |
 
 ---
 
-## 18 Session summary
+## 15 Blind spots prevented
 
-```mermaid
-flowchart TD
-    A["Incoming incremental batch"] --> B["Validate business keys"]
-    B --> C["MERGE on order ID"]
-    C --> D["Update changed matches"]
-    C --> E["Insert new records"]
-    C --> F["Skip unchanged matches"]
-    D --> G["Validate target"]
-    E --> G
-    F --> G
-    G --> H["Rerun safely"]
-```
+| Blind spot | Possible surprise | Protection used here |
+|---|---|---|
+| Unknown starting state | Expected counts do not match | Cell 02 resets the session tables |
+| Duplicate source keys | Multiple rows try to update one target row | Source duplicate validation |
+| Duplicate target keys | One business record already exists more than once | Target duplicate validation |
+| Null business keys | Rows cannot be identified reliably | Null-key validation |
+| Mutable value used in ON | A changed row looks new | Stable <code>order_id</code> match |
+| Normal inequality with nullable data | A change involving null can be missed | Null-safe <code>&lt;=&gt;</code> |
+| Unconditional matched update | Identical rows are processed again | Changed-values condition |
+| Non-deterministic update expression | Rerun changes data again | Deterministic source values |
+| Delete for rows absent from an incremental batch | Valid older rows are removed | No <code>WHEN NOT MATCHED BY SOURCE DELETE</code> |
+| Different source and target data types | MERGE fails or casts unexpectedly | One explicit schema |
+| Concurrent writers | Another job changes files during this run | Outside this single-writer exercise; production needs concurrency planning |
 
-- Direct append is unsuitable when an incremental batch contains existing business keys.
-- `MERGE` compares source and target records using a business key.
-- `WHEN MATCHED` updates existing records.
-- `WHEN NOT MATCHED` inserts new records.
-- A condition on the matched action can avoid unnecessary updates.
-- An idempotent rerun produces the same target data without duplicates.
-- Source-key and target-state validations provide evidence that the merge behaved correctly.
+An upsert is not automatically idempotent. For example, <code>target.amount + source.amount</code> or a newly generated current timestamp would change the target again during a rerun.
+
+---
+
+## 16 Session summary
+
+- Append is unsafe when a batch can contain existing business keys.
+- Upsert is the update-or-insert requirement; MERGE is the command used to implement it.
+- The ON condition identifies the same business record.
+- The matched condition updates only changed values.
+- The not-matched clause inserts new business keys.
+- Source and target validation prevents ambiguous behavior.
+- Before-and-after evidence proves every row-level result.
+- Rerunning the same deterministic batch produces the same final data.
 
 ## Active Recall
 
-1. Why does directly appending an incremental batch create duplicate business keys?
-2. What is the purpose of the `ON` condition in a `MERGE` operation?
-3. Why does the matched clause compare source and target values before updating?
-4. How can you prove that rerunning a batch is data-idempotent?
+1. Why is upsert not a separate Delta command from MERGE in this exercise?
+2. What does the ON condition decide, and why must it use a stable key?
+3. Why is the changed-values condition added to WHEN MATCHED?
+4. What evidence proves that the rerun is data-idempotent?
 
 ---
 
 ## Official references
 
-- [Fabric Trial workspace](https://learn.microsoft.com/fabric/data-engineering/tutorial-lakehouse-get-started)
-- [Create a Lakehouse in Microsoft Fabric](https://learn.microsoft.com/fabric/data-engineering/create-lakehouse)
-- [Explore Lakehouse data with a Notebook](https://learn.microsoft.com/fabric/data-engineering/lakehouse-notebook-explore)
-- [Partitioning for Delta tables and MERGE syntax](https://learn.microsoft.com/fabric/data-engineering/delta-lake-partitioning)
-- [Concurrency control for Delta tables](https://learn.microsoft.com/fabric/data-engineering/delta-lake-concurrency-control)
-- [Low shuffle MERGE optimization](https://learn.microsoft.com/fabric/data-engineering/low-shuffle-merge)
-- [Inspect Delta table metadata and history](https://learn.microsoft.com/fabric/data-engineering/delta-lake-describe)
-- [Troubleshoot Lakehouse and MERGE errors](https://learn.microsoft.com/fabric/data-engineering/troubleshoot-lakehouse)
+- [Fabric trial capacity](https://learn.microsoft.com/en-us/fabric/fundamentals/fabric-trial)
+- [Create a Fabric workspace](https://learn.microsoft.com/en-us/fabric/data-engineering/tutorial-lakehouse-get-started)
+- [Create a Lakehouse](https://learn.microsoft.com/en-us/fabric/data-engineering/create-lakehouse)
+- [Explore Lakehouse data with a Notebook](https://learn.microsoft.com/en-us/fabric/data-engineering/lakehouse-notebook-explore)
+- [NotebookUtils file system utilities](https://learn.microsoft.com/en-us/fabric/data-engineering/notebookutils/notebookutils-file-system)
+- [Fabric Runtime 2.0](https://learn.microsoft.com/en-us/fabric/data-engineering/runtime-2-0)
+- [Inspect Delta table history](https://learn.microsoft.com/en-us/fabric/data-engineering/delta-lake-describe)
+- [Low shuffle MERGE](https://learn.microsoft.com/en-us/fabric/data-engineering/low-shuffle-merge)
+- [Concurrency control](https://learn.microsoft.com/en-us/fabric/data-engineering/delta-lake-concurrency-control)
+- [Troubleshoot Lakehouse and MERGE errors](https://learn.microsoft.com/en-us/fabric/data-engineering/troubleshoot-lakehouse)
